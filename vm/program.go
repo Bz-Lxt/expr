@@ -28,6 +28,7 @@ type Program struct {
 	functions []Function
 	debugInfo map[string]string
 	span      *Span
+	fragments []file.Fragment
 }
 
 // NewProgram returns a new Program. It's used by the compiler.
@@ -60,6 +61,13 @@ func NewProgram(
 // Source returns origin file.Source.
 func (program *Program) Source() file.Source {
 	return program.source
+}
+
+// SetFragments attaches source fragment metadata (e.g. named modules)
+// used to attribute runtime errors to the fragment they originate from.
+// It is called by the compiler; zero value is fine for plain programs.
+func (program *Program) SetFragments(fragments []file.Fragment) {
+	program.fragments = fragments
 }
 
 // Node returns origin ast.Node.

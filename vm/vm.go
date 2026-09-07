@@ -65,7 +65,9 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			if err, ok := r.(error); ok {
 				f.Wrap(err)
 			}
-			err = f.Bind(program.source)
+			bound := f.Bind(program.source)
+			bound.Attribute(program.fragments)
+			err = bound
 		}
 	}()
 

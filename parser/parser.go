@@ -136,8 +136,9 @@ func (p *Parser) createMemberNode(n *MemberNode, loc file.Location) *MemberNode 
 }
 
 type Tree struct {
-	Node   Node
-	Source file.Source
+	Node      Node
+	Source    file.Source
+	Fragments []file.Fragment // named source fragments (e.g. inlined modules); nil for a plain parse
 }
 
 func Parse(input string) (*Tree, error) {
@@ -146,6 +147,18 @@ func Parse(input string) (*Tree, error) {
 
 func ParseWithConfig(input string, config *conf.Config) (*Tree, error) {
 	return new(Parser).Parse(input, config)
+}
+
+// ParseFragment parses an expression fragment that may be inlined into
+// another expression (e.g. a named module). It behaves like
+// ParseWithConfig, except that the predicate pointer syntax (`#` and
+// the `.field` shorthand) is also accepted at the top level. This
+// allows fragments to be used as predicates; the checker still rejects
+// pointer accessors outside of a predicate once the fragment is
+// inlined into its usage context.
+func ParseFragment(input string, config *conf.Config) (*Tree, error) {
+	p := &Parser{depth: 1}
+	return p.Parse(input, config)
 }
 
 func (p *Parser) error(format string, args ...any) {

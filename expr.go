@@ -12,6 +12,7 @@ import (
 	"github.com/expr-lang/expr/compiler"
 	"github.com/expr-lang/expr/conf"
 	"github.com/expr-lang/expr/file"
+	"github.com/expr-lang/expr/module"
 	"github.com/expr-lang/expr/optimizer"
 	"github.com/expr-lang/expr/parser"
 	"github.com/expr-lang/expr/patcher"
@@ -225,6 +226,27 @@ func MaxNodes(n uint) Option {
 	}
 }
 
+// Module registers a named expression module that can be referenced by
+// name (as an identifier) from the compiled expression and from other
+// modules. Modules allow large rules to be split into composable,
+// named fragments instead of being maintained as a single copy-pasted
+// string, for example:
+//
+//	expr.Compile(`isAdmin and item.published`,
+//	    expr.Env(env),
+//	    expr.Module("isAdmin", `user.role == "admin"`),
+//	)
+//
+// Modules are inlined at compile time. Cyclic module dependencies and
+// errors originating from a module body are reported with the name of
+// the module they come from, so the source of the failure can be
+// located precisely.
+func Module(name, expression string) Option {
+	return func(c *conf.Config) {
+		c.Modules[name] = expression
+	}
+}
+
 // Compile parses and compiles given input expression to bytecode program.
 func Compile(input string, ops ...Option) (*vm.Program, error) {
 	config := conf.CreateNew()
@@ -236,17 +258,32 @@ func Compile(input string, ops ...Option) (*vm.Program, error) {
 	}
 	config.Check()
 
-	tree, err := checker.ParseCheck(input, config)
-	if err != nil {
-		return nil, err
+	var tree *parser.Tree
+	if len(config.Modules) == 0 {
+		t, err := checker.ParseCheck(input, config)
+		if err != nil {
+			return nil, err
+		}
+		tree = t
+	} else {
+		t, err := module.Compose(input, config)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := new(checker.Checker).PatchAndCheck(t, config); err != nil {
+			return nil, attributeError(t, err)
+		}
+		tree = t
 	}
 
 	if config.Optimize {
-		err = optimizer.Optimize(&tree.Node, config)
+		err := optimizer.Optimize(&tree.Node, config)
 		if err != nil {
 			var fileError *file.Error
 			if errors.As(err, &fileError) {
-				return nil, fileError.Bind(tree.Source)
+				fileError.Bind(tree.Source)
+				fileError.Attribute(tree.Fragments)
+				return nil, fileError
 			}
 			return nil, err
 		}
@@ -258,6 +295,16 @@ func Compile(input string, ops ...Option) (*vm.Program, error) {
 	}
 
 	return program, nil
+}
+
+// attributeError attributes a bound error to the source fragment
+// (module) it originates from, if any.
+func attributeError(tree *parser.Tree, err error) error {
+	var fileError *file.Error
+	if errors.As(err, &fileError) {
+		fileError.Attribute(tree.Fragments)
+	}
+	return err
 }
 
 // Run evaluates given bytecode program.

@@ -34,7 +34,8 @@ type Config struct {
 	Visitors     []ast.Visitor
 	Functions    FunctionsTable
 	Builtins     FunctionsTable
-	Disabled     map[string]bool // disabled builtins
+	Disabled     map[string]bool   // disabled builtins
+	Modules      map[string]string // named expression modules inlined at compile time
 	NtCache      nature.Cache
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
@@ -53,6 +54,7 @@ func CreateNew() *Config {
 		Functions:    make(map[string]*builtin.Function),
 		Builtins:     make(map[string]*builtin.Function),
 		Disabled:     make(map[string]bool),
+		Modules:      make(map[string]string),
 	}
 	for _, f := range builtin.Builtins {
 		c.Builtins[f.Name] = f

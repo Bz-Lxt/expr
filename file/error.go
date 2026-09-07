@@ -63,6 +63,31 @@ func (e *Error) Bind(source Source) *Error {
 	return e
 }
 
+// Attribute attributes a bound error to a named source fragment. If the
+// error location falls inside a named fragment, the line is rewritten to
+// be fragment-local and the message is prefixed with the fragment name.
+//
+// Attribute must be called after Bind, as it relies on the resolved line
+// and on the location offsets being relative to the same source the
+// fragments were computed for. It returns true when the error was
+// attributed to a named fragment.
+func (e *Error) Attribute(fragments []Fragment) bool {
+	if e == nil || len(fragments) == 0 {
+		return false
+	}
+	for _, f := range fragments {
+		if f.Name == "" {
+			continue
+		}
+		if e.From >= f.Location.From && e.From < f.Location.To {
+			e.Line = e.Line - f.Line + 1
+			e.Message = fmt.Sprintf("in module %q: %s", f.Name, e.Message)
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Error) Unwrap() error {
 	return e.Prev
 }

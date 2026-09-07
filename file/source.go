@@ -16,6 +16,15 @@ func (s Source) String() string {
 	return s.raw
 }
 
+// Fragment describes a named source fragment inside a composite source
+// (for example, a named expression module inlined into a larger program).
+// It is used to attribute errors to the fragment they originate from.
+type Fragment struct {
+	Name     string   // fragment name (e.g. module name); empty for the main expression
+	Location Location // [From, To) rune range of the fragment body within the source
+	Line     int      // 1-based line of the fragment body start within the source
+}
+
 func (s Source) Snippet(line int) (string, bool) {
 	if s.raw == "" {
 		return "", false

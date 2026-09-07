@@ -49,11 +49,111 @@ type VM struct {
 	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
 	scopePoolIdx int     // Current index into scopePool for allocation
 	currScope    *Scope  // Cached pointer to the current scope (optimization)
+
+	// Cooperative (sharded) execution state. A run can be paused at safe
+	// points (opcode boundaries) and later resumed without restarting; see
+	// RunShard.
+	shardState runState // stateIdle when no run is active, statePaused when yielded at a safe point
+	stepBudget int      // Opcodes the current shard may still execute; -1 means unlimited
+	prog       *Program // Program retained so a paused run resumes without being passed again
+	env        any      // Env retained for the same reason
+	fnArgsBuf  []any    // Reusable scratch buffer for call arguments, kept across shards of one run
 }
 
-func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+// State reports the outcome of a sharded run (see RunShard and Resume).
+type State int
+
+const (
+	// StatePaused means the shard budget was exhausted before the program
+	// finished. The VM is stopped at a safe point (an opcode boundary) and
+	// keeps its full execution state; call Resume (or RunShard again) to
+	// continue. The result of a paused shard is always nil.
+	StatePaused State = iota
+	// StateDone means the program finished; the returned value is the
+	// program result.
+	StateDone
+)
+
+// runState tracks whether a sharded run is currently paused at a safe point.
+type runState uint8
+
+const (
+	// stateIdle: no run is in progress (never started, finished, or aborted
+	// by an error).
+	stateIdle runState = iota
+	// statePaused: the run yielded at an opcode boundary and can be resumed.
+	statePaused
+)
+
+// Run evaluates the bytecode program to completion. It always starts a fresh
+// execution, even if the VM is paused from a previous sharded run; use
+// RunShard or Resume for cooperative pause/resume.
+func (vm *VM) Run(program *Program, env any) (any, error) {
+	vm.shardState = stateIdle
+	out, _, err := vm.run(program, env, -1)
+	return out, err
+}
+
+// RunShard executes at most maxSteps opcodes of the program, then yields
+// control back to the caller at an opcode boundary (a safe point). It enables
+// cooperative, sharded scheduling: a scheduler can run a bounded slice of a
+// rule, do other work (or run a slice of another rule), and resume later
+// without restarting the program.
+//
+// On a fresh VM the call starts the program with the given env. On a VM that
+// is paused from a previous shard, the call resumes that run: program and env
+// are then ignored and may be nil (use Resume for a more explicit entry
+// point).
+//
+// The VM yields only between opcodes, so every opcode executes atomically
+// with respect to sharding. When paused, the instruction pointer addresses
+// the next opcode to run and the stack, scopes and variables already hold the
+// results of all previous opcodes. A function-call opcode is therefore either
+// not started yet or already completed with its result on the stack; resuming
+// never re-invokes it, so function side effects are never repeated.
+//
+// It returns StatePaused (with a nil result) when the shard budget is
+// exhausted and the program has not finished, and StateDone together with the
+// program result when execution completes. An error terminates the run: the
+// VM is no longer paused and a subsequent call starts a fresh run.
+func (vm *VM) RunShard(program *Program, env any, maxSteps int) (any, State, error) {
+	if maxSteps <= 0 {
+		return nil, StateDone, fmt.Errorf("vm: maxSteps must be a positive integer, got %d", maxSteps)
+	}
+	return vm.run(program, env, maxSteps)
+}
+
+// Resume continues a paused sharded run, executing at most maxSteps opcodes.
+// It is equivalent to calling RunShard on a paused VM (program and env are
+// taken from the run that started). It returns an error if the VM is not
+// paused: no run was started, or the run already finished or failed.
+func (vm *VM) Resume(maxSteps int) (any, State, error) {
+	if vm.shardState != statePaused {
+		return nil, StateDone, fmt.Errorf("vm: cannot resume: execution is not paused")
+	}
+	return vm.RunShard(nil, nil, maxSteps)
+}
+
+// Paused reports whether the VM is stopped at a safe point and can be resumed
+// with Resume or RunShard.
+func (vm *VM) Paused() bool {
+	return vm.shardState == statePaused
+}
+
+// run executes program either to completion (maxSteps < 0) or in shards of at
+// most maxSteps opcodes. When the shard budget is exhausted at a safe point it
+// returns StatePaused while preserving the whole VM state; calling run again
+// resumes from the next opcode. On a paused VM the program/env arguments are
+// ignored in favor of the ones retained from the call that started the run.
+func (vm *VM) run(program *Program, env any, maxSteps int) (_ any, _ State, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			// The failing opcode did not finish, so the VM is not at a safe
+			// point and the run cannot be resumed: resuming would re-execute
+			// the opcode — for a call opcode that would repeat the function
+			// call and its side effects. Drop the shard state so the next
+			// call starts a fresh run.
+			vm.shardState = stateIdle
 			var location file.Location
 			if vm.ip-1 < len(program.locations) {
 				location = program.locations[vm.ip-1]
@@ -62,37 +162,38 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 				Location: location,
 				Message:  fmt.Sprintf("%v", r),
 			}
-			if err, ok := r.(error); ok {
-				f.Wrap(err)
+			if e, ok := r.(error); ok {
+				f.Wrap(e)
 			}
 			err = f.Bind(program.source)
 		}
 	}()
 
-	if vm.Stack == nil {
-		vm.Stack = make([]any, 0, 2)
+	if vm.shardState == statePaused {
+		// Resume: continue from the saved safe point with the program and
+		// env of the call that started the run.
+		program = vm.prog
+		env = vm.env
 	} else {
-		clearSlice(vm.Stack)
-		vm.Stack = vm.Stack[0:0]
+		if program == nil {
+			return nil, StateDone, fmt.Errorf("program is nil")
+		}
+		vm.reset(program)
+		vm.prog = program
+		vm.env = env
 	}
-	if vm.Scopes != nil {
-		clearSlice(vm.Scopes)
-		vm.Scopes = vm.Scopes[0:0]
-	}
-	vm.scopePoolIdx = 0 // Reset pool index for reuse
-	vm.currScope = nil
-	if len(vm.Variables) < program.variables {
-		vm.Variables = make([]any, program.variables)
-	}
-	if vm.MemoryBudget == 0 {
-		vm.MemoryBudget = conf.DefaultMemoryBudget
-	}
-	vm.memory = 0
-	vm.ip = 0
-
-	var fnArgsBuf []any
+	vm.stepBudget = maxSteps
 
 	for vm.ip < len(program.Bytecode) {
+		// Cooperative safe point. The budget is checked only between
+		// opcodes, so every opcode executes atomically: when paused, vm.ip
+		// addresses the next opcode to run and the state of the stack,
+		// scopes and variables fully describes the progress made so far.
+		if vm.stepBudget == 0 {
+			vm.shardState = statePaused
+			return nil, StatePaused, nil
+		}
+
 		if debug && vm.debug {
 			<-vm.step
 		}
@@ -417,7 +518,7 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 
 		case OpCall1:
 			var args []any
-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, 1)
+			args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, 1)
 			out, err := program.functions[arg](args...)
 			if err != nil {
 				panic(err)
@@ -426,7 +527,7 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 
 		case OpCall2:
 			var args []any
-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, 2)
+			args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, 2)
 			out, err := program.functions[arg](args...)
 			if err != nil {
 				panic(err)
@@ -435,7 +536,7 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 
 		case OpCall3:
 			var args []any
-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, 3)
+			args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, 3)
 			out, err := program.functions[arg](args...)
 			if err != nil {
 				panic(err)
@@ -445,7 +546,7 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		case OpCallN:
 			fn := vm.pop().(Function)
 			var args []any
-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, arg)
+			args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, arg)
 			out, err := fn(args...)
 			if err != nil {
 				panic(err)
@@ -455,13 +556,13 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		case OpCallFast:
 			fn := vm.pop().(func(...any) any)
 			var args []any
-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, arg)
+			args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, arg)
 			vm.push(fn(args...))
 
 		case OpCallSafe:
 			fn := vm.pop().(SafeFunction)
 			var args []any
-			args, fnArgsBuf = vm.getArgsForFunc(fnArgsBuf, program, arg)
+			args, vm.fnArgsBuf = vm.getArgsForFunc(vm.fnArgsBuf, program, arg)
 			out, mem, err := fn(args...)
 			if err != nil {
 				panic(err)
@@ -650,10 +751,16 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			panic(fmt.Sprintf("unknown bytecode %#x", op))
 		}
 
+		if vm.stepBudget > 0 {
+			vm.stepBudget--
+		}
+
 		if debug && vm.debug {
 			vm.curr <- vm.ip
 		}
 	}
+
+	vm.shardState = stateIdle
 
 	if debug && vm.debug {
 		close(vm.curr)
@@ -661,10 +768,38 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 	}
 
 	if len(vm.Stack) > 0 {
-		return vm.pop(), nil
+		return vm.pop(), StateDone, nil
 	}
 
-	return nil, nil
+	return nil, StateDone, nil
+}
+
+// reset initializes the VM state for a fresh execution of program. It is not
+// called when resuming a paused run: the preserved instruction pointer, stack,
+// scopes and variables are what make a resume continue exactly where the
+// previous shard stopped.
+func (vm *VM) reset(program *Program) {
+	if vm.Stack == nil {
+		vm.Stack = make([]any, 0, 2)
+	} else {
+		clearSlice(vm.Stack)
+		vm.Stack = vm.Stack[0:0]
+	}
+	if vm.Scopes != nil {
+		clearSlice(vm.Scopes)
+		vm.Scopes = vm.Scopes[0:0]
+	}
+	vm.scopePoolIdx = 0 // Reset pool index for reuse
+	vm.currScope = nil
+	if len(vm.Variables) < program.variables {
+		vm.Variables = make([]any, program.variables)
+	}
+	if vm.MemoryBudget == 0 {
+		vm.MemoryBudget = conf.DefaultMemoryBudget
+	}
+	vm.memory = 0
+	vm.ip = 0
+	vm.fnArgsBuf = nil
 }
 
 func (vm *VM) push(value any) {

@@ -28,14 +28,21 @@ type Config struct {
 	Optimize     bool
 	Strict       bool
 	ShortCircuit bool
-	Profile      bool
-	MaxNodes     uint
-	ConstFns     map[string]reflect.Value
-	Visitors     []ast.Visitor
-	Functions    FunctionsTable
-	Builtins     FunctionsTable
-	Disabled     map[string]bool // disabled builtins
-	NtCache      nature.Cache
+	// Concurrent enables concurrent evaluation of independent branches
+	// (function call arguments, array/map elements, operands of
+	// non-short-circuit operators). Short-circuit operators (&&, ||, ??,
+	// if/else) keep their conditional evaluation. Each branch is evaluated
+	// in an isolated VM; when several branches fail, the error of the
+	// leftmost failing branch is returned.
+	Concurrent bool
+	Profile    bool
+	MaxNodes   uint
+	ConstFns   map[string]reflect.Value
+	Visitors   []ast.Visitor
+	Functions  FunctionsTable
+	Builtins   FunctionsTable
+	Disabled   map[string]bool // disabled builtins
+	NtCache    nature.Cache
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser

@@ -213,6 +213,89 @@ func (c *compiler) calcBackwardJump(to int) int {
 	return len(c.bytecode) + 1 - to
 }
 
+// compileBranches compiles a list of mutually independent, value-producing
+// branches in source order. Each branch closure must leave exactly its
+// result value(s) on the stack (map key/value pairs leave two values).
+//
+// When concurrent evaluation is enabled (see expr.ConcurrentEvaluation)
+// and at least two branches contain function calls, the branches are
+// wrapped in an OpParallel block. The VM then evaluates the branches in
+// separate goroutines within isolated VMs and pushes their results in
+// source order. Short-circuit operators (&&, ||, ??, if/else) are never
+// compiled via compileBranches, so their conditional evaluation is
+// preserved.
+func (c *compiler) compileBranches(nodes []ast.Node, body func(i int)) {
+	if !c.canCompileBranchesConcurrently(nodes) {
+		for i := range nodes {
+			body(i)
+		}
+		return
+	}
+
+	op := c.emit(OpParallel, 0) // placeholder argument, patched below
+	branches := make([]Branch, 0, len(nodes))
+	for i := range nodes {
+		start := len(c.bytecode)
+		body(i)
+		branches = append(branches, Branch{Start: start, Len: len(c.bytecode) - start})
+	}
+	c.arguments[op-1] = c.addConstant(branches)
+}
+
+// canCompileBranchesConcurrently reports whether the branches should be
+// emitted as an OpParallel block. Only branches containing function calls
+// are expensive enough to justify goroutine overhead, and at least two
+// such branches are needed for concurrent evaluation to be useful.
+func (c *compiler) canCompileBranchesConcurrently(nodes []ast.Node) bool {
+	if c.config == nil || !c.config.Concurrent || len(nodes) < 2 {
+		return false
+	}
+	heavy := 0
+	for _, n := range nodes {
+		if containsCall(n) {
+			heavy++
+		}
+	}
+	return heavy >= 2
+}
+
+// containsCall reports whether the node tree contains a function or
+// builtin call.
+func containsCall(node ast.Node) bool {
+	if node == nil {
+		return false
+	}
+	d := callDetector{}
+	ast.Walk(&node, &d)
+	return d.found
+}
+
+type callDetector struct {
+	found bool
+}
+
+func (d *callDetector) Visit(node *ast.Node) {
+	switch (*node).(type) {
+	case *ast.CallNode, *ast.BuiltinNode:
+		d.found = true
+	}
+}
+
+// compileBinaryOperands compiles the left and right operands of a binary
+// operator that always evaluates both operands (i.e. not a short-circuit
+// operator).
+func (c *compiler) compileBinaryOperands(node *ast.BinaryNode) {
+	c.compileBranches([]ast.Node{node.Left, node.Right}, func(i int) {
+		if i == 0 {
+			c.compile(node.Left)
+			c.derefInNeeded(node.Left)
+		} else {
+			c.compile(node.Right)
+			c.derefInNeeded(node.Right)
+		}
+	})
+}
+
 func (c *compiler) compile(node ast.Node) {
 	c.nodes = append(c.nodes, node)
 	defer func() {
@@ -488,80 +571,47 @@ func (c *compiler) BinaryNode(node *ast.BinaryNode) {
 		c.patchJump(end)
 
 	case "<":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpLess)
 
 	case ">":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpMore)
 
 	case "<=":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpLessOrEqual)
 
 	case ">=":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpMoreOrEqual)
 
 	case "+":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpAdd)
 
 	case "-":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpSubtract)
 
 	case "*":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpMultiply)
 
 	case "/":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpDivide)
 
 	case "%":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpModulo)
 
 	case "**", "^":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpExponent)
 
 	case "in":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpIn)
 
 	case "matches":
@@ -582,31 +632,19 @@ func (c *compiler) BinaryNode(node *ast.BinaryNode) {
 		}
 
 	case "contains":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpContains)
 
 	case "startsWith":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpStartsWith)
 
 	case "endsWith":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpEndsWith)
 
 	case "..":
-		c.compile(node.Left)
-		c.derefInNeeded(node.Left)
-		c.compile(node.Right)
-		c.derefInNeeded(node.Right)
+		c.compileBinaryOperands(node)
 		c.emit(OpRange)
 
 	case "??":
@@ -759,19 +797,28 @@ func (c *compiler) MemberNode(node *ast.MemberNode) {
 }
 
 func (c *compiler) SliceNode(node *ast.SliceNode) {
-	c.compile(node.Node)
-	if node.To != nil {
-		c.compile(node.To)
-		c.derefInNeeded(node.To)
-	} else {
-		c.emit(OpLen)
-	}
-	if node.From != nil {
-		c.compile(node.From)
-		c.derefInNeeded(node.From)
-	} else {
-		c.emitPush(0)
-	}
+	// OpSlice pops from, to, node: branches are compiled in this exact
+	// stack order. Missing bounds are replaced by their default opcodes.
+	c.compileBranches([]ast.Node{node.Node, node.To, node.From}, func(i int) {
+		switch i {
+		case 0:
+			c.compile(node.Node)
+		case 1:
+			if node.To != nil {
+				c.compile(node.To)
+				c.derefInNeeded(node.To)
+			} else {
+				c.emit(OpLen)
+			}
+		case 2:
+			if node.From != nil {
+				c.compile(node.From)
+				c.derefInNeeded(node.From)
+			} else {
+				c.emitPush(0)
+			}
+		}
+	})
 	c.emit(OpSlice)
 }
 
@@ -794,7 +841,8 @@ func (c *compiler) CallNode(node *ast.CallNode) {
 				fnNumIn--
 			}
 		}
-		for i, arg := range node.Arguments {
+		c.compileBranches(node.Arguments, func(i int) {
+			arg := node.Arguments[i]
 			c.compile(arg)
 
 			var in reflect.Type
@@ -805,11 +853,11 @@ func (c *compiler) CallNode(node *ast.CallNode) {
 			}
 
 			c.derefParam(in, arg)
-		}
+		})
 	} else {
-		for _, arg := range node.Arguments {
-			c.compile(arg)
-		}
+		c.compileBranches(node.Arguments, func(i int) {
+			c.compile(node.Arguments[i])
+		})
 	}
 
 	if ident, ok := node.Callee.(*ast.IdentifierNode); ok {
@@ -1149,7 +1197,8 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 
 	if id, ok := builtin.Index[node.Name]; ok {
 		f := builtin.Builtins[id]
-		for i, arg := range node.Arguments {
+		c.compileBranches(node.Arguments, func(i int) {
+			arg := node.Arguments[i]
 			c.compile(arg)
 			argType := arg.Type()
 			if argType.Kind() == reflect.Ptr || arg.Nature().IsUnknown(c.ntCache) {
@@ -1162,7 +1211,7 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 					}
 				}
 			}
-		}
+		})
 
 		if f.Fast != nil {
 			c.emit(OpCallBuiltin1, id)
@@ -1292,18 +1341,19 @@ func (c *compiler) ConditionalNode(node *ast.ConditionalNode) {
 }
 
 func (c *compiler) ArrayNode(node *ast.ArrayNode) {
-	for _, node := range node.Nodes {
-		c.compile(node)
-	}
+	c.compileBranches(node.Nodes, func(i int) {
+		c.compile(node.Nodes[i])
+	})
 
 	c.emitPush(len(node.Nodes))
 	c.emit(OpArray)
 }
 
 func (c *compiler) MapNode(node *ast.MapNode) {
-	for _, pair := range node.Pairs {
-		c.compile(pair)
-	}
+	// Each pair is a branch leaving the key and the value on the stack.
+	c.compileBranches(node.Pairs, func(i int) {
+		c.compile(node.Pairs[i])
+	})
 
 	c.emitPush(len(node.Pairs))
 	c.emit(OpMap)

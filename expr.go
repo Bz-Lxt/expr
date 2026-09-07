@@ -141,6 +141,22 @@ func DisableShortCircuit() Option {
 	}
 }
 
+// ConcurrentEvaluation enables concurrent evaluation of independent
+// expression branches: function call arguments, array and map elements,
+// and operands of non-short-circuit operators. Branches are evaluated in
+// separate goroutines, each running in an isolated VM.
+//
+// Short-circuit evaluation of the &&, ||, ?? and if/else operators is
+// preserved: branches that would not be evaluated serially are never
+// evaluated. When several branches return an error, the error of the
+// leftmost failing branch (in source order) is returned, regardless of
+// goroutine completion order.
+func ConcurrentEvaluation() Option {
+	return func(c *conf.Config) {
+		c.Concurrent = true
+	}
+}
+
 // Patch adds visitor to list of visitors what will be applied before compiling AST to bytecode.
 func Patch(visitor ast.Visitor) Option {
 	return func(c *conf.Config) {

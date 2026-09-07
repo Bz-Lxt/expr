@@ -86,5 +86,6 @@ const (
 	OpBegin
 	OpAnd
 	OpOr
+	OpParallel
 	OpEnd // This opcode must be at the end of this list.
 )

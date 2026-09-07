@@ -15,6 +15,15 @@ import (
 	"github.com/expr-lang/expr/vm/runtime"
 )
 
+// Branch describes a contiguous bytecode range of an independent branch
+// that can be evaluated concurrently. The bytecode of an OpParallel block
+// is the concatenation of its branches' ranges; each branch leaves its
+// result value(s) on the stack, exactly as in serial evaluation.
+type Branch struct {
+	Start int // Absolute index of the first opcode of the branch.
+	Len   int // Number of opcodes in the branch.
+}
+
 // Program represents a compiled expression.
 type Program struct {
 	Bytecode  []Opcode
@@ -380,6 +389,13 @@ func (program *Program) DisassembleWriter(w io.Writer) {
 
 		case OpOr:
 			code("OpOr")
+
+		case OpParallel:
+			if branches, ok := program.Constants[arg].([]Branch); ok {
+				_, _ = fmt.Fprintf(w, "%v\t%v\t<%v>\t%v branches\n", pp, "OpParallel", arg, len(branches))
+			} else {
+				argument("OpParallel")
+			}
 
 		case OpEnd:
 			code("OpEnd")

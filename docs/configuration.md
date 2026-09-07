@@ -132,3 +132,34 @@ The timezone is used for the following functions:
 date("2024-11-23 12:00:00") // parses the date in the specified timezone
 now() // returns the current time in the specified timezone
 ```
+
+## Concurrent evaluation
+
+By default, expressions are evaluated serially. The [`ConcurrentEvaluation`](https://pkg.go.dev/github.com/expr-lang/expr#ConcurrentEvaluation)
+option enables concurrent evaluation of independent branches that perform function calls:
+
+- function call arguments,
+- array and map elements,
+- operands of non-short-circuit operators (e.g. `+`, `<`, `in`, `matches`),
+- slice bounds.
+
+```go
+program, err := expr.Compile(
+    `fetchUser(id) + fetchOrder(orderId)`,
+    expr.Env(env),
+    expr.ConcurrentEvaluation(),
+)
+```
+
+Each branch is evaluated in a separate goroutine running in an isolated VM:
+branches have their own stacks and variables, and cannot observe each other's
+intermediate state. Only groups containing at least two branches with function
+calls are parallelized, so trivial expressions pay no goroutine overhead.
+
+Short-circuit evaluation is preserved: the right-hand sides of `&&`, `||` and
+`??` and the not-taken branch of `if/else` are never evaluated, exactly as in
+serial evaluation. When several branches fail, the error of the leftmost
+failing branch (in source order) is returned, independently of goroutine
+scheduling. Note that side effects of the evaluated functions themselves are
+not cancelled — every branch that starts runs to completion, as with serial
+evaluation.

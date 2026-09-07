@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/expr-lang/expr/builtin"
@@ -42,6 +43,7 @@ type VM struct {
 	Variables    []any
 	MemoryBudget uint
 	ip           int
+	stopIP       int // Exclusive end of the bytecode range executed by eval; 0 is replaced by len(Bytecode).
 	memory       uint
 	debug        bool
 	step         chan struct{}
@@ -51,24 +53,52 @@ type VM struct {
 	currScope    *Scope  // Cached pointer to the current scope (optimization)
 }
 
-func (vm *VM) Run(program *Program, env any) (_ any, err error) {
+func (vm *VM) Run(program *Program, env any) (any, error) {
+	_, err := vm.run(program, env, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(vm.Stack) > 0 {
+		return vm.pop(), nil
+	}
+	return nil, nil
+}
+
+// run executes the given bytecode range (or the whole program when stop is
+// 0) and returns the values left on the stack. It is used both for
+// top-level evaluation and for concurrent evaluation of independent
+// branches (see evalBranches).
+func (vm *VM) run(program *Program, env any, start, stop int) (outputs []any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			var location file.Location
-			if vm.ip-1 < len(program.locations) {
-				location = program.locations[vm.ip-1]
+			if abort, ok := r.(parallelAbort); ok {
+				err = abort.err
+				return
 			}
-			f := &file.Error{
-				Location: location,
-				Message:  fmt.Sprintf("%v", r),
-			}
-			if err, ok := r.(error); ok {
-				f.Wrap(err)
-			}
-			err = f.Bind(program.source)
+			err = bindPanic(r, program, vm.ip)
 		}
 	}()
 
+	vm.reset(program)
+	vm.ip = start
+	if stop == 0 {
+		stop = len(program.Bytecode)
+	}
+	vm.stopIP = stop
+
+	outputs = vm.eval(program, env)
+
+	if debug && vm.debug {
+		close(vm.curr)
+		close(vm.step)
+	}
+
+	return outputs, nil
+}
+
+// reset prepares the VM for execution of the program, reusing pre-allocated
+// buffers when possible.
+func (vm *VM) reset(program *Program) {
 	if vm.Stack == nil {
 		vm.Stack = make([]any, 0, 2)
 	} else {
@@ -88,11 +118,31 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		vm.MemoryBudget = conf.DefaultMemoryBudget
 	}
 	vm.memory = 0
-	vm.ip = 0
+}
 
+// bindPanic converts a runtime panic into a file.Error bound to the source
+// of the program.
+func bindPanic(r any, program *Program, ip int) error {
+	var location file.Location
+	if ip-1 >= 0 && ip-1 < len(program.locations) {
+		location = program.locations[ip-1]
+	}
+	f := &file.Error{
+		Location: location,
+		Message:  fmt.Sprintf("%v", r),
+	}
+	if err, ok := r.(error); ok {
+		f.Wrap(err)
+	}
+	return f.Bind(program.source)
+}
+
+// eval is the interpreter loop: it executes opcodes from vm.ip until vm.ip
+// reaches vm.stopIP and returns the values left on the stack (in order).
+func (vm *VM) eval(program *Program, env any) []any {
 	var fnArgsBuf []any
 
-	for vm.ip < len(program.Bytecode) {
+	for vm.ip < vm.stopIP {
 		if debug && vm.debug {
 			<-vm.step
 		}
@@ -638,6 +688,26 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			b := vm.pop()
 			vm.push(a.(bool) || b.(bool))
 
+		case OpParallel:
+			if vm.debug {
+				// Debugger support: evaluate the branch bytecode serially
+				// (it immediately follows this opcode) so every instruction
+				// can be stepped.
+				break
+			}
+			branches, _ := program.Constants[arg].([]Branch)
+			outputs, err := vm.evalBranches(program, env, branches)
+			if err != nil {
+				// The error is already a bound file.Error; parallelAbort
+				// prevents the deferred recover from wrapping it again.
+				panic(parallelAbort{err})
+			}
+			for _, v := range outputs {
+				vm.push(v)
+			}
+			last := branches[len(branches)-1]
+			vm.ip = last.Start + last.Len
+
 		case OpEnd:
 			vm.Scopes = vm.Scopes[:len(vm.Scopes)-1]
 			if len(vm.Scopes) > 0 {
@@ -655,16 +725,89 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		}
 	}
 
-	if debug && vm.debug {
-		close(vm.curr)
-		close(vm.step)
+	return vm.Stack
+}
+
+// parallelAbort propagates an error produced by a concurrently evaluated
+// branch (already bound to its source location) through the VM's
+// panic-based error path without wrapping it into another file.Error.
+type parallelAbort struct {
+	err error
+}
+
+// evalBranches evaluates independent branches concurrently, each in its
+// own isolated VM (private stack, scopes, variables and memory budget).
+// Variables declared before the parallel block are inherited as a copy,
+// and active iteration scopes are inherited read-only, so predicates
+// inside loops keep working.
+//
+// The method waits for all branches. If one or more branches fail, the
+// error of the leftmost failing branch (in source order) is returned,
+// making the result independent of goroutine scheduling.
+func (vm *VM) evalBranches(program *Program, env any, branches []Branch) ([]any, error) {
+	results := make([]branchResult, len(branches))
+	var wg sync.WaitGroup
+	for i, br := range branches {
+		wg.Add(1)
+		go func(i int, br Branch) {
+			defer wg.Done()
+			sub := &VM{MemoryBudget: vm.MemoryBudget}
+			results[i].outputs, results[i].err = sub.runBranch(program, env, br, vm)
+		}(i, br)
+	}
+	wg.Wait()
+
+	for i := range results {
+		if results[i].err != nil {
+			return nil, results[i].err
+		}
+	}
+	outputs := make([]any, 0, len(branches))
+	for i := range results {
+		outputs = append(outputs, results[i].outputs...)
+	}
+	return outputs, nil
+}
+
+type branchResult struct {
+	outputs []any
+	err     error
+}
+
+// runBranch evaluates a single branch on the receiver VM. The receiver
+// must be a freshly created VM; declared variables are inherited as an
+// isolated copy and the parent's iteration scopes are inherited
+// read-only.
+func (vm *VM) runBranch(program *Program, env any, br Branch, parent *VM) (outputs []any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if abort, ok := r.(parallelAbort); ok {
+				err = abort.err
+				return
+			}
+			err = bindPanic(r, program, vm.ip)
+		}
+	}()
+
+	vm.reset(program)
+
+	// Inherit declared variables into an isolated copy: branches may read
+	// variables declared before the parallel block, while variables
+	// declared inside a branch stay private to it.
+	vm.Variables = make([]any, program.variables)
+	copy(vm.Variables, parent.Variables)
+
+	// Inherit the active iteration scopes read-only. The branch gets its
+	// own scope stack, so nested loops never mutate the parent's scopes.
+	vm.Scopes = append(vm.Scopes, parent.Scopes...)
+	if len(vm.Scopes) > 0 {
+		vm.currScope = vm.Scopes[len(vm.Scopes)-1]
 	}
 
-	if len(vm.Stack) > 0 {
-		return vm.pop(), nil
-	}
+	vm.ip = br.Start
+	vm.stopIP = br.Start + br.Len
 
-	return nil, nil
+	return vm.eval(program, env), nil
 }
 
 func (vm *VM) push(value any) {

@@ -1,6 +1,7 @@
 package checker
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -32,17 +33,68 @@ var (
 // ParseCheck parses input expression and checks its types. Also, it applies
 // all provided patchers. In case of error, it returns error with a tree.
 func ParseCheck(input string, config *conf.Config) (*parser.Tree, error) {
-	tree, err := parser.ParseWithConfig(input, config)
-	if err != nil {
-		return tree, err
+	tree, parseErr := parser.ParseWithConfig(input, config)
+
+	// Clean parse: apply all patchers and run the full check.
+	if parseErr == nil {
+		_, err := new(Checker).PatchAndCheck(tree, config)
+		if err != nil {
+			return tree, err
+		}
+		return tree, nil
 	}
 
-	_, err = new(Checker).PatchAndCheck(tree, config)
-	if err != nil {
-		return tree, err
+	// The parser reported errors, but it may have recovered a tree with
+	// complete statements. Run the checker on recovered parts so independent
+	// type errors are not lost. Patchers are skipped, as they expect a fully
+	// parseable tree.
+	diagnostics := extractDiagnostics(parseErr)
+
+	var genericErrs []error
+	if tree.Node != nil {
+		_, checkErr := new(Checker).Check(tree, config)
+		if checkErr != nil {
+			fileErrs := extractDiagnostics(checkErr)
+			if len(fileErrs) > 0 {
+				diagnostics = append(diagnostics, fileErrs...)
+			} else {
+				genericErrs = append(genericErrs, checkErr)
+			}
+		}
+	}
+
+	if len(diagnostics) > 0 {
+		result := file.Diagnostics(diagnostics...).Bind(tree.Source)
+		if len(genericErrs) == 0 {
+			if len(result) == 1 {
+				return tree, result[0]
+			}
+			return tree, result
+		}
+		return tree, errors.Join(append([]error{result}, genericErrs...)...)
+	}
+	if len(genericErrs) == 1 {
+		return tree, genericErrs[0]
+	}
+	if len(genericErrs) > 0 {
+		return tree, errors.Join(genericErrs...)
 	}
 
 	return tree, nil
+}
+
+// extractDiagnostics extracts file diagnostics from either a single *file.Error
+// or a file.Errors collection.
+func extractDiagnostics(err error) []*file.Error {
+	var errs file.Errors
+	if errors.As(err, &errs) {
+		return errs
+	}
+	var single *file.Error
+	if errors.As(err, &single) {
+		return []*file.Error{single}
+	}
+	return nil
 }
 
 // Check calls Check on a disposable Checker.
@@ -54,7 +106,7 @@ type Checker struct {
 	config          *conf.Config
 	predicateScopes []predicateScope
 	varScopes       []varScope
-	err             *file.Error
+	errors          []*file.Error
 	needsReset      bool
 }
 
@@ -131,8 +183,12 @@ func (v *Checker) check(tree *parser.Tree) (reflect.Type, error) {
 		t = anyType
 	}
 
-	if v.err != nil {
-		return t, v.err.Bind(tree.Source)
+	if len(v.errors) > 0 {
+		diagnostics := file.Diagnostics(v.errors...).Bind(tree.Source)
+		if len(diagnostics) == 1 {
+			return t, diagnostics[0]
+		}
+		return t, diagnostics
 	}
 
 	if v.config.Expect != reflect.Invalid {
@@ -163,7 +219,7 @@ func (v *Checker) reset(config *conf.Config) {
 		clearSlice(v.varScopes)
 		v.predicateScopes = v.predicateScopes[:0]
 		v.varScopes = v.varScopes[:0]
-		v.err = nil
+		v.errors = nil
 	}
 	v.needsReset = true
 
@@ -237,12 +293,10 @@ func (v *Checker) visit(node ast.Node) Nature {
 }
 
 func (v *Checker) error(node ast.Node, format string, args ...any) Nature {
-	if v.err == nil { // show first error
-		v.err = &file.Error{
-			Location: node.Location(),
-			Message:  fmt.Sprintf(format, args...),
-		}
-	}
+	v.errors = append(v.errors, &file.Error{
+		Location: node.Location(),
+		Message:  fmt.Sprintf(format, args...),
+	})
 	return Nature{}
 }
 
@@ -689,14 +743,12 @@ func (v *Checker) callNode(node *ast.CallNode) Nature {
 	}
 
 	if nt.Kind == reflect.Func {
-		outType, err := v.checkArguments(fnName, nt, node.Arguments, node)
-		if err != nil {
-			if v.err == nil {
-				v.err = err
-			}
+		outNature, errs := v.checkArguments(fnName, nt, node.Arguments, node)
+		if len(errs) > 0 {
+			v.errors = append(v.errors, errs...)
 			return Nature{}
 		}
-		return outType
+		return outNature
 	}
 	return v.error(node, "%s is not callable", nt.String())
 }
@@ -1019,21 +1071,19 @@ func (v *Checker) checkFunction(f *builtin.Function, node ast.Node, arguments []
 		}
 		return v.config.NtCache.FromType(t)
 	} else if len(f.Types) == 0 {
-		nt, err := v.checkArguments(f.Name, v.config.NtCache.FromType(f.Type()), arguments, node)
-		if err != nil {
-			if v.err == nil {
-				v.err = err
-			}
+		nt, errs := v.checkArguments(f.Name, v.config.NtCache.FromType(f.Type()), arguments, node)
+		if len(errs) > 0 {
+			v.errors = append(v.errors, errs...)
 			return Nature{}
 		}
 		// No type was specified, so we assume the function returns any.
 		return nt
 	}
-	var lastErr *file.Error
+	var lastErrs []*file.Error
 	for _, t := range f.Types {
-		outNature, err := v.checkArguments(f.Name, v.config.NtCache.FromType(t), arguments, node)
-		if err != nil {
-			lastErr = err
+		outNature, errs := v.checkArguments(f.Name, v.config.NtCache.FromType(t), arguments, node)
+		if len(errs) > 0 {
+			lastErrs = errs
 			continue
 		}
 
@@ -1046,10 +1096,8 @@ func (v *Checker) checkFunction(f *builtin.Function, node ast.Node, arguments []
 
 		return outNature
 	}
-	if lastErr != nil {
-		if v.err == nil {
-			v.err = lastErr
-		}
+	if len(lastErrs) > 0 {
+		v.errors = append(v.errors, lastErrs...)
 		return Nature{}
 	}
 
@@ -1061,23 +1109,23 @@ func (v *Checker) checkArguments(
 	fn Nature,
 	arguments []ast.Node,
 	node ast.Node,
-) (Nature, *file.Error) {
+) (Nature, []*file.Error) {
 	if fn.IsUnknown(&v.config.NtCache) {
 		return Nature{}, nil
 	}
 
 	numOut := fn.NumOut()
 	if numOut == 0 {
-		return Nature{}, &file.Error{
+		return Nature{}, []*file.Error{{
 			Location: node.Location(),
 			Message:  fmt.Sprintf("func %v doesn't return value", name),
-		}
+		}}
 	}
 	if numOut > 2 {
-		return Nature{}, &file.Error{
+		return Nature{}, []*file.Error{{
 			Location: node.Location(),
 			Message:  fmt.Sprintf("func %v returns more then two values", name),
-		}
+		}}
 	}
 
 	// If func is method on an env, first argument should be a receiver,
@@ -1092,37 +1140,37 @@ func (v *Checker) checkArguments(
 		fnInOffset = 1
 	}
 
-	var err *file.Error
+	var errs []*file.Error
 	isVariadic := fn.IsVariadic()
 	if isVariadic {
 		if len(arguments) < fnNumIn-1 {
-			err = &file.Error{
+			errs = append(errs, &file.Error{
 				Location: node.Location(),
 				Message:  fmt.Sprintf("not enough arguments to call %v", name),
-			}
+			})
 		}
 	} else {
 		if len(arguments) > fnNumIn {
-			err = &file.Error{
+			errs = append(errs, &file.Error{
 				Location: node.Location(),
 				Message:  fmt.Sprintf("too many arguments to call %v", name),
-			}
+			})
 		}
 		if len(arguments) < fnNumIn {
-			err = &file.Error{
+			errs = append(errs, &file.Error{
 				Location: node.Location(),
 				Message:  fmt.Sprintf("not enough arguments to call %v", name),
-			}
+			})
 		}
 	}
 
-	if err != nil {
+	if len(errs) > 0 {
 		// If we have an error, we should still visit all arguments to
 		// type check them, as a patch can fix the error later.
 		for _, arg := range arguments {
 			_ = v.visit(arg)
 		}
-		return fn.Out(&v.config.NtCache, 0), err
+		return fn.Out(&v.config.NtCache, 0), errs
 	}
 
 	for i, arg := range arguments {
@@ -1151,10 +1199,11 @@ func (v *Checker) checkArguments(
 			if in.Kind == reflect.Ptr || in.Kind == reflect.Interface {
 				continue
 			}
-			return Nature{}, &file.Error{
+			errs = append(errs, &file.Error{
 				Location: arg.Location(),
 				Message:  fmt.Sprintf("cannot use nil as argument (type %s) to call %v", in.String(), name),
-			}
+			})
+			continue
 		}
 
 		// Check if argument is assignable to the function input type.
@@ -1171,14 +1220,15 @@ func (v *Checker) checkArguments(
 		}
 
 		if !assignable && !argNature.IsUnknown(&v.config.NtCache) {
-			return Nature{}, &file.Error{
+			errs = append(errs, &file.Error{
 				Location: arg.Location(),
 				Message:  fmt.Sprintf("cannot use %s as argument (type %s) to call %v ", argNature.String(), in.String(), name),
-			}
+			})
+			continue
 		}
 	}
 
-	return fn.Out(&v.config.NtCache, 0), nil
+	return fn.Out(&v.config.NtCache, 0), errs
 }
 
 func traverseAndReplaceIntegerNodesWithFloatNodes(node *ast.Node, newNature Nature) {

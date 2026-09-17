@@ -438,6 +438,9 @@ invalid operation: > (mismatched types interface {} and mock.Foo) (1:5)
 func NilFn doesn't return value (1:1)
  | NilFn() and BoolFn()
  | ^
+unknown name BoolFn (1:13)
+ | NilFn() and BoolFn()
+ | ............^
 `,
 		},
 		{`'str' in String`, `

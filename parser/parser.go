@@ -51,7 +51,8 @@ type Parser struct {
 	lexer            *Lexer
 	current, stashed Token
 	hasStash         bool
-	err              *file.Error
+	err              *file.Error // first error in the current recovery region
+	errors           []*file.Error
 	config           *conf.Config
 	depth            int  // predicate call depth
 	nodeCount        uint // tracks number of AST nodes created
@@ -73,9 +74,9 @@ func (p *Parser) Parse(input string, config *conf.Config) (*Tree, error) {
 	source := file.NewSource(input)
 	p.lexer.Reset(source)
 	p.next()
-	node := p.parseSequenceExpression()
+	node := p.parseSequence(true)
 
-	if !p.current.Is(EOF) {
+	if !p.current.Is(EOF) && len(p.errors) == 0 {
 		p.error("unexpected token %v", p.current)
 	}
 
@@ -83,15 +84,20 @@ func (p *Parser) Parse(input string, config *conf.Config) (*Tree, error) {
 		Node:   node,
 		Source: source,
 	}
-	err := p.err
+	diagnostics := file.Diagnostics(p.errors...)
 
 	// cleanup non-reusable pointer values and reset state
 	p.err = nil
+	p.errors = nil
 	p.config = nil
 	p.lexer.Reset(file.Source{})
 
-	if err != nil {
-		return tree, err.Bind(source)
+	if len(diagnostics) > 0 {
+		diagnostics.Bind(source)
+		if len(diagnostics) == 1 {
+			return tree, diagnostics[0]
+		}
+		return tree, diagnostics
 	}
 
 	return tree, nil
@@ -153,11 +159,22 @@ func (p *Parser) error(format string, args ...any) {
 }
 
 func (p *Parser) errorAt(token Token, format string, args ...any) {
-	if p.err == nil { // show first error
-		p.err = &file.Error{
+	if p.err == nil { // show first error per recovery region
+		e := &file.Error{
 			Location: token.Location,
 			Message:  fmt.Sprintf(format, args...),
 		}
+		p.err = e
+		p.errors = append(p.errors, e)
+	}
+}
+
+// report records a fatal error (for example from the lexer) in the same way
+// as errorAt.
+func (p *Parser) report(e *file.Error) {
+	if p.err == nil {
+		p.err = e
+		p.errors = append(p.errors, e)
 	}
 }
 
@@ -176,13 +193,13 @@ func (p *Parser) next() {
 	case errors.Is(err, io.EOF):
 		p.error("unexpected end of expression")
 	case errors.As(err, &e):
-		p.err = e
+		p.report(e)
 	default:
-		p.err = &file.Error{
+		p.report(&file.Error{
 			Location: p.current.Location,
 			Message:  "unknown lexing error",
 			Prev:     err,
-		}
+		})
 	}
 }
 
@@ -197,24 +214,110 @@ func (p *Parser) expect(kind Kind, values ...string) {
 // parse functions
 
 func (p *Parser) parseSequenceExpression() Node {
-	nodes := []Node{p.parseExpression(0)}
+	return p.parseSequence(false)
+}
 
-	for p.current.Is(Operator, ";") && p.err == nil {
-		p.next()
-		// If a trailing semicolon is present, break out.
+// parseSequence parses statements separated by ';'. If recovery is enabled
+// and a statement fails, parsing resumes at the next statement; failed
+// statements are dropped. Recovery is enabled only at the top level: nested
+// contexts (parentheses, predicates, if branches) must propagate an error to
+// their enclosing construct, so it discards partially built nodes instead of
+// leaking them into the tree.
+func (p *Parser) parseSequence(recovery bool) Node {
+	var nodes []Node
+
+	for {
+		// If an error is already pending, it belongs to an enclosing
+		// construct; do not attempt recovery here.
+		if p.err != nil {
+			return nil
+		}
+
+		n := p.parseExpression(0)
+
+		if p.err != nil {
+			if !recovery {
+				return nil
+			}
+			p.synchronize()
+			if p.err != nil {
+				// A fatal lexer error makes further recovery impossible.
+				return nil
+			}
+			if p.current.Is(EOF) {
+				break
+			}
+			if p.current.Is(Operator, ";") {
+				p.next()
+				if p.current.Is(EOF) {
+					break
+				}
+				continue
+			}
+			// Stopped at an unmatched closing bracket; leave it for the
+			// enclosing parser to consume.
+			break
+		}
+
+		nodes = append(nodes, n)
+
 		if p.current.Is(EOF) {
 			break
 		}
-		nodes = append(nodes, p.parseExpression(0))
+		if p.current.Is(Operator, ";") {
+			p.next()
+			// If a trailing semicolon is present, break out.
+			if p.current.Is(EOF) {
+				break
+			}
+			continue
+		}
+		break
 	}
 
-	if len(nodes) == 1 {
+	switch len(nodes) {
+	case 0:
+		return nil
+	case 1:
 		return nodes[0]
+	default:
+		return p.createNode(&SequenceNode{
+			Nodes: nodes,
+		}, nodes[0].Location())
 	}
+}
 
-	return p.createNode(&SequenceNode{
-		Nodes: nodes,
-	}, nodes[0].Location())
+// synchronize discards the rest of a failed statement until a semicolon at
+// the same nesting level, an unmatched closing bracket, or EOF. It clears
+// the current region error so parsing of the next statement can continue.
+func (p *Parser) synchronize() {
+	if p.err == nil {
+		return
+	}
+	p.err = nil
+
+	depth := 0
+	for {
+		switch {
+		case p.current.Is(EOF):
+			return
+		case depth == 0 && p.current.Is(Operator, ";"):
+			return
+		case p.current.Is(Bracket, "(", "[", "{"):
+			depth++
+		case p.current.Is(Bracket, ")", "]", "}"):
+			if depth == 0 {
+				// Unmatched closing bracket; it belongs to an enclosing context.
+				return
+			}
+			depth--
+		}
+		p.next()
+		if p.err != nil {
+			// Fatal lexer error; recovery is impossible.
+			return
+		}
+	}
 }
 
 func (p *Parser) parseExpression(precedence int) Node {
@@ -326,8 +429,14 @@ func (p *Parser) parseVariableDeclaration() Node {
 	p.expect(Identifier)
 	p.expect(Operator, "=")
 	value := p.parseExpression(0)
+	if value == nil {
+		return nil
+	}
 	p.expect(Operator, ";")
 	node := p.parseSequenceExpression()
+	if node == nil {
+		return nil
+	}
 	return p.createNode(&VariableDeclaratorNode{
 		Name:  variableName.Value,
 		Value: value,
@@ -355,12 +464,20 @@ func (p *Parser) parseConditionalIf() Node {
 		p.expect(Bracket, "}")
 	}
 
+	if nodeCondition == nil || expr1 == nil || expr2 == nil {
+		// Recovery could not produce a complete conditional; bail out rather
+		// than emitting an AST with nil branches.
+		if p.err == nil {
+			p.error("unexpected token %v", p.current)
+		}
+		return nil
+	}
+
 	return &ConditionalNode{
 		Cond: nodeCondition,
 		Exp1: expr1,
 		Exp2: expr2,
 	}
-
 }
 
 func (p *Parser) parseConditional(node Node) Node {

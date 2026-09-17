@@ -2,6 +2,7 @@ package file
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -82,4 +83,61 @@ func (e *Error) format() string {
 		e.Column+1, // add one to the 0-based column for display
 		e.Snippet,
 	)
+}
+
+// Errors is a collection of independent diagnostics.
+type Errors []*Error
+
+// Diagnostics deduplicates and stably sorts given errors by their position
+// (From, then To), using the message as a final tie-breaker. It returns nil
+// if no errors are provided.
+func Diagnostics(errs ...*Error) Errors {
+	if len(errs) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(errs))
+	out := make(Errors, 0, len(errs))
+	for _, e := range errs {
+		key := fmt.Sprintf("%d|%d|%s", e.From, e.To, e.Message)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].From != out[j].From {
+			return out[i].From < out[j].From
+		}
+		if out[i].To != out[j].To {
+			return out[i].To < out[j].To
+		}
+		return out[i].Message < out[j].Message
+	})
+	return out
+}
+
+func (errs Errors) Error() string {
+	messages := make([]string, len(errs))
+	for i, e := range errs {
+		messages[i] = e.Error()
+	}
+	return strings.Join(messages, "\n")
+}
+
+// Bind binds all diagnostics to the source.
+func (errs Errors) Bind(source Source) Errors {
+	for _, e := range errs {
+		e.Bind(source)
+	}
+	return errs
+}
+
+// Unwrap allows errors.Is and errors.As to inspect each individual diagnostic.
+func (errs Errors) Unwrap() []error {
+	out := make([]error, len(errs))
+	for i, e := range errs {
+		out[i] = e
+	}
+	return out
 }

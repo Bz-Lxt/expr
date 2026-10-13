@@ -49,6 +49,7 @@ type VM struct {
 	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
 	scopePoolIdx int     // Current index into scopePool for allocation
 	currScope    *Scope  // Cached pointer to the current scope (optimization)
+	trace        []traceMarker
 }
 
 func (vm *VM) Run(program *Program, env any) (_ any, err error) {
@@ -65,7 +66,36 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			if err, ok := r.(error); ok {
 				f.Wrap(err)
 			}
-			err = f.Bind(program.source)
+			bound := f.Bind(program.source)
+			// Convert active trace markers into immutable frames. Markers
+			// are ordered outer-to-inner; iterator frame indices are read
+			// from the still-open scopes.
+			if len(vm.trace) > 0 {
+				frames := make([]TraceFrame, len(vm.trace))
+				for i, marker := range vm.trace {
+					index := marker.index
+					if marker.depth >= 0 && marker.depth < len(vm.Scopes) {
+						index = vm.Scopes[marker.depth].Index
+					}
+					frameLocation := file.Location{}
+					if marker.ip >= 0 && marker.ip < len(program.locations) {
+						frameLocation = program.locations[marker.ip]
+					}
+					frames[i] = TraceFrame{
+						Kind:     marker.kind,
+						Name:     marker.name,
+						Index:    index,
+						Key:      marker.key,
+						Location: frameLocation,
+					}
+				}
+				err = &TraceError{Diagnostic: bound, Frames: frames}
+			} else {
+				err = bound
+			}
+			// Drop the per-run marker state so that reusing this VM after a
+			// failure cannot leak frames into the next evaluation.
+			vm.trace = nil
 		}
 	}()
 
@@ -81,6 +111,7 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 	}
 	vm.scopePoolIdx = 0 // Reset pool index for reuse
 	vm.currScope = nil
+	vm.trace = nil
 	if len(vm.Variables) < program.variables {
 		vm.Variables = make([]any, program.variables)
 	}
@@ -645,6 +676,30 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			} else {
 				vm.currScope = nil
 			}
+
+		case OpTraceEnter:
+			info := program.Constants[arg].(*TraceInfo)
+			vm.trace = append(vm.trace, traceMarker{
+				ip:    vm.ip - 1,
+				depth: -1,
+				kind:  info.Kind,
+				index: info.Index,
+				key:   info.Key,
+				name:  info.Name,
+			})
+
+		case OpTraceIterEnter:
+			info := program.Constants[arg].(*TraceInfo)
+			vm.trace = append(vm.trace, traceMarker{
+				ip:    vm.ip - 1,
+				depth: len(vm.Scopes) - 1,
+				kind:  info.Kind,
+				index: -1,
+				name:  info.Name,
+			})
+
+		case OpTraceLeave:
+			vm.trace = vm.trace[:len(vm.trace)-1]
 
 		default:
 			panic(fmt.Sprintf("unknown bytecode %#x", op))

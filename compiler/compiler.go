@@ -131,7 +131,75 @@ func (c *compiler) emit(op Opcode, args ...int) int {
 	if len(c.nodes) > 0 {
 		loc = c.nodes[len(c.nodes)-1].Location()
 	}
-	return c.emitLocation(loc, op, arg)
+	ip := c.emitLocation(loc, op, arg)
+	if c.traceEnabled() {
+		// Collection iteration builtins emit OpBegin/OpEnd around the
+		// per-element body. Mark the iteration while the loop scope is open
+		// so a failure reports the element index it happened at.
+		switch op {
+		case OpBegin:
+			if node, ok := c.currentNode().(*ast.BuiltinNode); ok {
+				info := &TraceInfo{
+					Kind:  TraceIterator,
+					Index: -1,
+					Name:  node.Name,
+				}
+				c.emitLocation(loc, OpTraceIterEnter, c.addConstant(info))
+			}
+		case OpEnd:
+			c.emitLocation(loc, OpTraceLeave, 0)
+		}
+	}
+	return ip
+}
+
+func (c *compiler) currentNode() ast.Node {
+	if len(c.nodes) == 0 {
+		return nil
+	}
+	return c.nodes[len(c.nodes)-1]
+}
+
+func (c *compiler) traceEnabled() bool {
+	return c.config != nil && c.config.ErrorTrace
+}
+
+// withTrace emits OpTraceEnter/OpTraceLeave around the body. Both opcodes are
+// stack-neutral; if the body panics the matching leave is never executed and
+// the marker stays on the VM's trace stack to be reported on failure.
+func (c *compiler) withTrace(loc file.Location, info *TraceInfo, body func()) {
+	if !c.traceEnabled() {
+		body()
+		return
+	}
+	c.emitLocation(loc, OpTraceEnter, c.addConstant(info))
+	body()
+	c.emit(OpTraceLeave)
+}
+
+// traceCallName returns a human-readable name of a call's callee, or an empty
+// string when the callee is a dynamic value.
+func traceCallName(node *ast.CallNode) string {
+	switch callee := node.Callee.(type) {
+	case *ast.IdentifierNode:
+		return callee.Value
+	case *ast.MemberNode:
+		if property, ok := callee.Property.(*ast.StringNode); ok {
+			return property.Value
+		}
+	}
+	return ""
+}
+
+// traceMapKey extracts the literal key of a map pair.
+func traceMapKey(node *ast.PairNode) string {
+	switch key := node.Key.(type) {
+	case *ast.StringNode:
+		return key.Value
+	case *ast.IdentifierNode:
+		return key.Value
+	}
+	return ""
 }
 
 func (c *compiler) emitPush(value any) int {
@@ -776,6 +844,16 @@ func (c *compiler) SliceNode(node *ast.SliceNode) {
 }
 
 func (c *compiler) CallNode(node *ast.CallNode) {
+	c.withTrace(node.Location(), &TraceInfo{
+		Kind:  TraceCall,
+		Index: -1,
+		Name:  traceCallName(node),
+	}, func() {
+		c.callNode(node)
+	})
+}
+
+func (c *compiler) callNode(node *ast.CallNode) {
 	fn := node.Callee.Type()
 	if fn.Kind() == reflect.Func {
 		fnInOffset := 0
@@ -838,6 +916,16 @@ func (c *compiler) CallNode(node *ast.CallNode) {
 }
 
 func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
+	c.withTrace(node.Location(), &TraceInfo{
+		Kind:  TraceCall,
+		Index: -1,
+		Name:  node.Name,
+	}, func() {
+		c.builtinNode(node)
+	})
+}
+
+func (c *compiler) builtinNode(node *ast.BuiltinNode) {
 	switch node.Name {
 	case "all":
 		c.compile(node.Arguments[0])
@@ -1292,8 +1380,14 @@ func (c *compiler) ConditionalNode(node *ast.ConditionalNode) {
 }
 
 func (c *compiler) ArrayNode(node *ast.ArrayNode) {
-	for _, node := range node.Nodes {
-		c.compile(node)
+	for i, element := range node.Nodes {
+		element := element
+		c.withTrace(element.Location(), &TraceInfo{
+			Kind:  TraceArray,
+			Index: i,
+		}, func() {
+			c.compile(element)
+		})
 	}
 
 	c.emitPush(len(node.Nodes))
@@ -1301,8 +1395,21 @@ func (c *compiler) ArrayNode(node *ast.ArrayNode) {
 }
 
 func (c *compiler) MapNode(node *ast.MapNode) {
-	for _, pair := range node.Pairs {
-		c.compile(pair)
+	for _, pairNode := range node.Pairs {
+		pair, ok := pairNode.(*ast.PairNode)
+		if !ok {
+			c.compile(pairNode)
+			continue
+		}
+		// The parser assigns every pair the location of the opening brace,
+		// so use the key location to point at the actual map entry.
+		c.withTrace(pair.Key.Location(), &TraceInfo{
+			Kind:  TraceMap,
+			Index: -1,
+			Key:   traceMapKey(pair),
+		}, func() {
+			c.compile(pair)
+		})
 	}
 
 	c.emitPush(len(node.Pairs))

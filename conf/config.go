@@ -29,13 +29,19 @@ type Config struct {
 	Strict       bool
 	ShortCircuit bool
 	Profile      bool
-	MaxNodes     uint
-	ConstFns     map[string]reflect.Value
-	Visitors     []ast.Visitor
-	Functions    FunctionsTable
-	Builtins     FunctionsTable
-	Disabled     map[string]bool // disabled builtins
-	NtCache      nature.Cache
+	// ErrorTrace enables instrumentation of the compiled program so that a
+	// runtime error carries a structured outer-to-inner failure path through
+	// nested array/map elements, collection iterations and function calls.
+	// The trace state is kept per VM run, programs remain safe to share
+	// between goroutines.
+	ErrorTrace bool
+	MaxNodes   uint
+	ConstFns   map[string]reflect.Value
+	Visitors   []ast.Visitor
+	Functions  FunctionsTable
+	Builtins   FunctionsTable
+	Disabled   map[string]bool // disabled builtins
+	NtCache    nature.Cache
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser

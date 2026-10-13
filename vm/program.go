@@ -381,6 +381,20 @@ func (program *Program) DisassembleWriter(w io.Writer) {
 		case OpOr:
 			code("OpOr")
 
+		case OpTraceEnter, OpTraceIterEnter:
+			label := "OpTraceEnter"
+			if op == OpTraceIterEnter {
+				label = "OpTraceIterEnter"
+			}
+			if info, ok := program.Constants[arg].(*TraceInfo); ok {
+				_, _ = fmt.Fprintf(w, "%v\t%v\t<%v>\t{%v %q i:%d k:%q}\n", pp, label, arg, info.Kind, info.Name, info.Index, info.Key)
+			} else {
+				_, _ = fmt.Fprintf(w, "%v\t%v\t<%v>\n", pp, label, arg)
+			}
+
+		case OpTraceLeave:
+			code("OpTraceLeave")
+
 		case OpEnd:
 			code("OpEnd")
 

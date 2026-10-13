@@ -86,5 +86,14 @@ const (
 	OpBegin
 	OpAnd
 	OpOr
+	// OpTraceEnter pushes a statically described error trace frame
+	// (array element, map pair or function call).
+	OpTraceEnter
+	// OpTraceIterEnter pushes an error trace frame for a collection
+	// iteration; the element index is resolved from the current scope
+	// when a failure is reported.
+	OpTraceIterEnter
+	// OpTraceLeave pops the most recent error trace frame.
+	OpTraceLeave
 	OpEnd // This opcode must be at the end of this list.
 )

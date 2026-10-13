@@ -141,6 +141,24 @@ func DisableShortCircuit() Option {
 	}
 }
 
+// ErrorTrace enables structured runtime error tracing. When evaluation fails
+// inside a nested array or map element, a collection iteration (filter, map,
+// all, etc.) or a function call, the returned error can be unwrapped with
+// errors.As to a *vm.TraceError describing the failure path from the outer to
+// the inner layer. Each frame holds the node's original source location and
+// context such as the element index, map key or the function name.
+//
+// Instrumentation follows the actual control flow, so frames of branches
+// skipped by short-circuit evaluation are never recorded, and locations stay
+// accurate when optimization folds or rewrites parts of the expression.
+// Trace state is held per evaluation run, so compiled programs stay safe to
+// run concurrently and to reuse after a failed evaluation.
+func ErrorTrace() Option {
+	return func(c *conf.Config) {
+		c.ErrorTrace = true
+	}
+}
+
 // Patch adds visitor to list of visitors what will be applied before compiling AST to bytecode.
 func Patch(visitor ast.Visitor) Option {
 	return func(c *conf.Config) {
